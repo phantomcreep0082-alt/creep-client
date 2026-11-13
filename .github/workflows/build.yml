@@ -1,0 +1,131 @@
+name: CREEP CLIENT Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "CREEP_CLIENT_GITHUB_READY.zip"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: creep-client-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Extract and build launcher
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Extract launcher ZIP safely
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import shutil
+
+          archive = Path("CREEP_CLIENT_GITHUB_READY.zip")
+          destination = Path("_ci_project")
+          if not archive.is_file():
+              raise SystemExit("Missing CREEP_CLIENT_GITHUB_READY.zip in repository root.")
+
+          if destination.exists():
+              shutil.rmtree(destination)
+          destination.mkdir()
+
+          with ZipFile(archive) as zf:
+              for item in zf.infolist():
+                  target = (destination / item.filename).resolve()
+                  if destination.resolve() not in target.parents and target != destination.resolve():
+                      raise SystemExit(f"Unsafe ZIP path rejected: {item.filename}")
+              zf.extractall(destination)
+
+          files = sorted(p for p in destination.rglob("*") if p.is_file())
+          Path("_ci_project_inventory.txt").write_text(
+              "\n".join(str(p.relative_to(destination)) for p in files),
+              encoding="utf-8"
+          )
+          print(f"Extracted {len(files)} files.")
+          print("\n".join(str(p.relative_to(destination)) for p in files[:200]))
+          PY
+
+      - name: Build project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Find the project directory containing a recognized build definition.
+          ROOT="$(python3 - <<'PY'
+          from pathlib import Path
+          base = Path("_ci_project")
+          markers = ("gradlew", "build.gradle", "build.gradle.kts", "pom.xml", "package.json")
+          candidates = [base] + [p for p in base.rglob("*") if p.is_dir()]
+          for folder in candidates:
+              if any((folder / marker).is_file() for marker in markers):
+                  print(folder)
+                  break
+          PY
+          )"
+
+          if [[ -z "$ROOT" ]]; then
+            echo "::error::No Gradle, Maven, or Node project definition was found in the ZIP."
+            echo "The ZIP was extracted and its file list will be uploaded for inspection."
+            exit 1
+          fi
+
+          echo "Building project at: $ROOT"
+          cd "$ROOT"
+
+          if [[ -f "./gradlew" ]]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon build
+          elif [[ -f "build.gradle" || -f "build.gradle.kts" ]]; then
+            gradle --no-daemon build
+          elif [[ -f "./mvnw" ]]; then
+            chmod +x ./mvnw
+            ./mvnw -B package
+          elif [[ -f "pom.xml" ]]; then
+            mvn -B package
+          elif [[ -f "package.json" ]]; then
+            npm install
+            npm run build --if-present
+          else
+            echo "::error::Could not determine a supported build command."
+            exit 1
+          fi
+
+      - name: Upload build outputs and extracted project
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: creep-client-build-and-diagnostics
+          path: |
+            _ci_project/
+            _ci_project_inventory.txt
+            **/build/libs/*.jar
+            **/target/*.jar
+            **/dist/
+            **/out/
+          if-no-files-found: warn
+          retention-days: 14
